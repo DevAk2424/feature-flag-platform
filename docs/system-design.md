@@ -154,3 +154,86 @@ does not change:
 The deliberate lesson of the portfolio: **the language is interchangeable; the
 contracts — stable bucketing, monotonic versions, forward rollback, proposal-gated
 automation — are the product.**
+
+---
+
+# Enterprise v2 addendum — streaming microservices evolution
+
+v2 (under `enterprise/`) re-implements the same contracts as separate
+microservices with streaming-first propagation. The evaluation semantics
+(bucketing, rule order, reasons, guarded AI execution) are unchanged —
+they are the platform's contract; the transport and deployment shape are
+what evolved.
+
+## Streaming propagation (Kafka + SSE)
+
+- **Write path**: dashboard / API -> control plane service method ->
+  JPA commit + history + audit -> publish `FlagConfigEvent` to the
+  `flag-config-events` Kafka topic (keyed by flag key, so per-flag order
+  is preserved). Sandbox profile: an in-process reactive bus plus an
+  internal SSE event feed (`GET /internal/config-events`) stand in for
+  the broker — the event schema and consumer logic are identical.
+- **Distribution path**: the streaming gateway consumes config events,
+  maintains the current snapshot in memory, and serves clients with
+  Server-Sent Events: `GET /stream/config` sends one `snapshot` event,
+  then a `flag-config` delta per change, plus heartbeat comments every
+  15s. RSocket server-streaming is the planned alternative transport for
+  binary/backpressure-sensitive clients (designed, not implemented; SSE
+  is the implemented stream).
+- **Why not REST polling**: polling trades freshness against load and
+  still misses bursts; a stream gives ~zero propagation delay at a
+  constant connection cost, and versioned deltas make missed-message
+  recovery trivial (reconnect -> fresh snapshot -> deltas).
+- **Consistency**: each event carries the global `configVersion`
+  (monotonic) and per-flag `version`. Consumers apply deltas only in
+  version order; a gap triggers snapshot resync. Rollback restores an old
+  flag snapshot *as a new forward version*, so version guards never see
+  time travel.
+
+## High availability
+
+- Gateway down / control plane down are different failures: if the
+  control plane or broker is unreachable, the gateway keeps serving its
+  **last-known-good snapshot** with `stale=true`; SDK-side evaluation is
+  local anyway (v1 SDK semantics), so flag evaluation never depends on a
+  live control plane.
+- Gateway is stateless apart from the snapshot (rebuildable from one
+  snapshot fetch + the event stream), so it scales horizontally behind
+  any L7 balancer that tolerates long-lived SSE connections.
+
+## AI risk service as a separate microservice (Python)
+
+- Consumes `flag-metrics` (Kafka in prod; HTTP ingest feeding the same
+  in-process consumer in sandbox), runs the deterministic risk engine,
+  and stores proposals — never flag state.
+- Approval emits a `FlagCommandEvent` on `flag-commands`; the control
+  plane consumes it and applies the change through its normal service
+  layer (versioned, audited as `risk-agent-approved-by:<approver>`).
+  The agent has no database credentials for flag tables: the guardrail
+  is architectural, not just a code check.
+
+## v1 -> v2 evolution map
+
+| v1 (Python, single process) | v2 (microservices) |
+|---|---|
+| `engine.py` | `flag-common` Java library (same bucketing algorithm, cross-checked values) |
+| `store.py` + `server.py` (REST) | `control-plane-service` (Spring Boot + JPA, event publishing) |
+| SDK polling + ETag | Gateway SSE stream (snapshot + deltas); polling removed as primary path |
+| `risk_agent.py` in-process | `ai-risk-service` (FastAPI) + `flag-commands` stream |
+| Static dashboard | React + Vite dashboard on the SSE stream |
+| In-memory store | JPA (H2 sandbox / Postgres prod), Kafka, Redis in compose for shared caches |
+
+## Implemented + tested vs designed-for-production
+
+Implemented and exercised in the sandbox (see `TEST_RESULTS.md`): the
+Java evaluation engine and its tests, control-plane versioning/audit/
+rollback/command application, gateway snapshot->delta SSE streaming,
+the Python risk engine + guarded approval flow over HTTP, the React
+build, and an end-to-end smoke through the real services.
+
+Designed for production, not run in this sandbox (no Docker/broker):
+Kafka as the actual broker (topics, partitioning and consumer code are
+written; the sandbox uses the in-process/SSE transport with the same
+event schema), Postgres (JPA entities and the prod profile are written;
+sandbox runs H2), Redis-backed shared caches, RSocket transport, and
+Kubernetes autoscaling policies.

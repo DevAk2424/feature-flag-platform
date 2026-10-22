@@ -1,0 +1,8 @@
+global: { scrape_interval: 15s }
+scrape_configs:
+  - job_name: control-plane
+    metrics_path: /actuator/prometheus
+    static_configs: [{ targets: ['control-plane:8080'] }]
+  - job_name: streaming-gateway
+    metrics_path: /actuator/prometheus
+    static_configs: [{ targets: ['streaming-gateway:8081'] }]

@@ -1,0 +1,32 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: control-plane-service
+  datasource:
+    url: "jdbc:h2:mem:flags;DB_CLOSE_DELAY=-1"
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+  kafka:
+    bootstrap-servers: "${KAFKA_BOOTSTRAP:localhost:9092}"
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+  datasource:
+    url: "${DATABASE_URL:jdbc:postgresql://localhost:5432/flags}"
+    username: "${DB_USER:flags}"
+    password: "${DB_PASSWORD:flags}"
+  jpa:
+    hibernate:
+      ddl-auto: update

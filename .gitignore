@@ -12,3 +12,10 @@ ff-cache.json
 .vscode/
 dist/
 build/
+
+# Enterprise v2 build artifacts
+enterprise/*/target/
+enterprise/frontend/node_modules/
+enterprise/frontend/dist/
+enterprise/ai-risk-service/.venv/
+*.pyc

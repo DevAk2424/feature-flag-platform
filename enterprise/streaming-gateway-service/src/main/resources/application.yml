@@ -1,0 +1,16 @@
+server:
+  port: 8081
+spring:
+  application:
+    name: streaming-gateway-service
+  kafka:
+    bootstrap-servers: "${KAFKA_BOOTSTRAP:localhost:9092}"
+gateway:
+  control-plane-url: "${CONTROL_PLANE_URL:http://localhost:8080}"
+  subscribe:
+    enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics

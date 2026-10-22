@@ -1,153 +1,94 @@
 # Distributed Feature Flag and Release Control Platform
 
-A LaunchDarkly-style feature-flag platform built by **Akshay K** as a system-design
-portfolio project: flag configuration is distributed to application instances, evaluated
-locally at low latency, rolled out gradually, kill-switched instantly, and guarded by an
-**AI release-risk agent** that recommends rollout / hold / rollback — but can only act
-through a human-approved, audit-logged proposal.
+A LaunchDarkly-style feature-flag platform built by **Akshay K**: flag
+configuration is distributed to application instances, evaluated locally at
+low latency, rolled out gradually, kill-switched instantly, and guarded by
+an **AI release-risk agent** that recommends rollout / hold / rollback — but
+can only act through a human-approved, audit-logged proposal.
 
-Implemented in **Python 3.12 standard library only** (no pip dependencies), so it runs
-and tests anywhere. See `docs/system-design.md` for the deep dive and how the same
-modules map to a Java / Spring Boot production version.
+This repo contains two generations:
 
-## Architecture
+- **v1 (repo root)** — Python 3.12 stdlib-only reference implementation
+  (REST control plane, polling SDK, dashboard). Still runnable, 32 tests.
+- **v2 Enterprise (`enterprise/`)** — microservices: Java 21 / Spring Boot
+  control plane + streaming gateway, Python FastAPI AI service, React
+  dashboard, **streaming-first** config propagation (Kafka topics + SSE
+  instead of REST polling). See `TEST_RESULTS.md` for sandbox test evidence.
 
-```
-                        +-------------------------------+
-        dashboard ----> |        Control Plane          |
-        (static JS)     |  featureflags/server.py       |
-                        |  ThreadingHTTPServer, REST    |
-                        +-------+---------------+-------+
-                                |               |
-                         FlagStore         RiskAgent
-                     (versions, history,   (analyze ->
-                      audit, metrics)       proposal -> approve)
-                                |
-                    GET /v1/config?env=prod   (version + ETag, 304)
-                                |
-                        +-------v---------------+
-                        |   SDK (sdk.py)        |   in every app instance
-                        |  poll -> local cache  |
-                        |  evaluate(): NO       |
-                        |  network, stale-safe  |
-                        +-------+---------------+
-                                |
-                        engine.evaluate()
-                     hashing / rules / rollout
+## Enterprise v2 architecture
+
+```mermaid
+flowchart LR
+    UI[React dashboard] -->|commands: rollout / kill switch| CP
+    UI -->|SSE: snapshot + deltas + heartbeat| GW
+    UI -->|recommendations / proposals| AI
+    CP[control-plane-service<br/>Java / Spring Boot + JPA] -->|flag-config-events| K[(Kafka)]
+    K --> GW[streaming-gateway-service<br/>Java / Spring Boot WebFlux]
+    GW -->|SSE stream| SDK[Application SDKs / clients]
+    MET[App metrics] -->|flag-metrics| AI[ai-risk-service<br/>Python / FastAPI]
+    AI -->|flag-commands<br/>ONLY after human approval| K
+    K --> CP
+    CP --- DB[(Postgres<br/>H2 in sandbox)]
+    GW -.->|control plane down| LKG[Last-known-good<br/>snapshot, stale=true]
 ```
 
-Components:
-
-| Module | Responsibility |
-|---|---|
-| `featureflags/engine.py` | Pure evaluation: stable SHA-256 bucketing, % rollouts, targeting rules, kill switch, evaluation reasons |
-| `featureflags/store.py` | Service layer: CRUD, monotonic versions, history snapshots, rollback, audit log, metrics |
-| `featureflags/server.py` | Control-plane REST API + dashboard hosting |
-| `featureflags/sdk.py` | Client SDK: polling, ETag/version cache invalidation, last-known-good offline evaluation |
-| `featureflags/risk_agent.py` | Deterministic release-risk analysis + guarded proposals |
-| `featureflags/static/` | Dashboard (flag list, rollout + kill-switch controls, risk panel, audit view) |
-| `demo.py` | Scripted end-to-end story (see below) |
-| `tests/` | 32 unittest tests (stdlib only) |
+| Service | Stack | Responsibility |
+|---|---|---|
+| `enterprise/flag-common` | Java 21 library | Domain model, SHA-256 stable bucketing, evaluation engine |
+| `enterprise/control-plane-service` | Java, Spring Boot MVC + Spring Data JPA | Flag CRUD, monotonic versioning, history, audit, rollback; publishes config events |
+| `enterprise/streaming-gateway-service` | Java, Spring Boot WebFlux | Consumes config events; SSE streaming to clients; last-known-good HA |
+| `enterprise/ai-risk-service` | Python, FastAPI | Metrics analysis, explainable recommendations, guarded proposals -> command events |
+| `enterprise/frontend` | React 18 + Vite | Live dashboard on the SSE stream, command controls, risk panel, audit view |
+| `enterprise/infra` | Compose / K8s / Prometheus | Postgres, Kafka, Redis, service manifests, scrape config |
 
 ## Quick start
 
-```bash
-# Run the control plane + dashboard
-python3 -m featureflags.server --port 8080
-# Dashboard:  http://127.0.0.1:8080/
-# Health:     http://127.0.0.1:8080/health
-
-# Run the demo (separate terminal / no server needed)
-python3 demo.py
-
-# Run the tests
-python3 -m unittest discover -s tests -v
-```
-
-**Demo API key** (documented demo credential, not a real secret): `demo-api-key-12345`,
-sent as the `x-api-key` header on every `/v1` request. Override with the
-`FEATUREFLAG_API_KEY` environment variable.
-
-## API examples
+### Enterprise v2 with Docker Compose (production-shaped)
 
 ```bash
-KEY="x-api-key: demo-api-key-12345"
-BASE=http://127.0.0.1:8080
-
-# List flags / create a flag
-curl -H "$KEY" $BASE/v1/flags
-curl -X POST -H "$KEY" -H 'Content-Type: application/json' $BASE/v1/flags \
-  -d '{"key":"new-checkout","fallthrough_percentage":5}'
-
-# Gradual rollout + kill switch (every write bumps version + audit)
-curl -X PATCH -H "$KEY" $BASE/v1/flags/new-checkout -d '{"fallthrough_percentage":25}'
-curl -X PATCH -H "$KEY" $BASE/v1/flags/new-checkout -d '{"enabled":false}'
-
-# Versioned config snapshot for SDKs (ETag / 304 supported)
-curl -H "$KEY" "$BASE/v1/config?env=prod"
-curl -H "$KEY" -H 'If-None-Match: "3"' "$BASE/v1/config?env=prod"   # -> 304 when current
-
-# Roll back to a previous version (restored as a NEW version)
-curl -X POST -H "$KEY" $BASE/v1/flags/new-checkout/rollback -d '{"to_version":1}'
-
-# Audit log
-curl -H "$KEY" "$BASE/v1/audit?flag_key=new-checkout"
-
-# Ingest metrics, then ask the risk agent for a proposal
-curl -X POST -H "$KEY" $BASE/v1/flags/new-checkout/metrics \
-  -d '{"sample_size":5000,"error_rate":0.09,"baseline_error_rate":0.01,
-       "latency_p95_ms":520,"baseline_latency_p95_ms":200,
-       "success_rate":0.90,"baseline_success_rate":0.98}'
-curl -X POST -H "$KEY" $BASE/v1/risk/proposals -d '{"flag_key":"new-checkout"}'
-# -> proposal {id, approval_token, recommendation}. Nothing has changed yet.
-curl -X POST -H "$KEY" $BASE/v1/risk/proposals/<id>/approve \
-  -d '{"approver":"your-name","approval_token":"<token-from-proposal>"}'
+cd enterprise/infra
+docker compose up --build
+# Dashboard http://localhost:5173 · Control plane http://localhost:8080
+# Gateway SSE http://localhost:8081/stream/config · AI service http://localhost:8090/health
 ```
 
-## SDK usage
+### Enterprise v2 sandbox profile (no Docker/Kafka needed)
 
-```python
-from featureflags.sdk import FeatureFlagClient
-
-client = FeatureFlagClient("http://127.0.0.1:8080", cache_file="ff-cache.json")
-client.start_polling()                      # background poller thread
-
-if client.is_enabled("checkout-redesign", user_id,
-                     {"segment": "beta", "plan": "pro"}):
-    new_checkout()
-# If the control plane dies, evaluate() keeps working from the
-# last-known-good cache and client.stale becomes True.
+```bash
+export JAVA_HOME=~/workspace/tools/jdk21   # or your own JDK 21
+mvn -f enterprise/pom.xml test            # Java suites (offline after first dependency fetch)
+cd enterprise/control-plane-service && mvn spring-boot:run   # :8080 (H2, in-process event bus + internal SSE feed)
+cd enterprise/streaming-gateway-service && mvn spring-boot:run  # :8081 (subscribes to the feed, re-streams SSE)
+cd enterprise/ai-risk-service && uvicorn app:app --port 8090    # Python AI service
+cd enterprise/frontend && npm install && npm run dev            # React dashboard :5173
 ```
 
-## Design decisions (summary)
+### v1 reference implementation
 
-- **Local evaluation, not remote calls** — evaluation is a pure function, so SDKs are
-  fast, cheap, and outage-proof; the network is only for config distribution.
-- **Stable hashing over user assignment tables** — SHA-256 bucketing needs no stored
-  per-user state and is monotonic: raising a rollout % never drops an included user.
-- **Rollback is a forward write** — restoring an old snapshot as a new version keeps
-  version-based cache invalidation correct (clients ignore older versions).
-- **The risk agent proposes, humans dispose** — no direct mutation path exists from
-  analysis to flags; approval requires the proposal's token and is rate-capped
-  (+25% max per step) and audit-logged under the approver's name.
-- **Deterministic agent, no LLM in the decision path** — release decisions must be
-  reproducible and explainable: every recommendation ships its reasons, confidence,
-  and the exact deltas used.
-- **Stdlib-only reference implementation** — the point is the design; the mapping to
-  Spring Boot / Redis / Kafka / CDN distribution is documented in
-  `docs/system-design.md`.
+```bash
+python3 -m featureflags.server --port 8080   # v1 control plane + dashboard
+python3 demo.py                              # scripted end-to-end story
+python3 -m unittest discover -s tests        # 32 tests
+```
 
-## Demo story (`python3 demo.py`)
+**Demo API key (v1 only)**: `demo-api-key-12345` as the `x-api-key` header —
+a documented demo credential, not a real secret.
 
-Seeds `checkout-redesign` (10% rollout, beta rule), `ai-recommendations` (50%) and
-kill-switched `legacy-search`; evaluates several users; ingests a bad release's
-metrics; the agent recommends **ROLLBACK** as a pending proposal; the flag provably
-does not change; a human approves with the token; the rollout goes to 0% as a new
-version with a `risk-agent-approved-by:...` audit entry.
+## Design highlights
 
-## Limitations (honest)
+- **Low-latency evaluation**: pure function of (flag, user); SDKs evaluate
+  locally, no network on the hot path (v1 SDK; v2 clients consume the stream).
+- **Streaming propagation**: every mutation becomes a `flag-config-events`
+  event (Kafka in prod; in-process bus + internal SSE feed in sandbox). The
+  gateway streams snapshot -> deltas -> heartbeats over SSE. No polling.
+- **Stable hashing**: SHA-256(`flagKey.salt.userKey`) -> bucket 0..9999;
+  inclusion is `bucket < pct x 100`, so raising a rollout never drops a user.
+- **Versioning & audit**: versions only move forward; rollback restores an
+  old snapshot *as a new version*; every change (human or approved AI
+  proposal) is audit-logged with actor and old/new values.
+- **Guarded AI execution**: the risk agent creates proposals with one-time
+  approval tokens. Approval emits a `flag-commands` event; the agent never
+  writes flag state directly. Increases are capped at +25% per approval.
 
-In-memory store (no persistence across restarts, file cache covers SDK side only),
-polling rather than push streaming, single-node control plane, demo-grade API-key
-auth. These are deliberate for a reference implementation; production replacements
-are spelled out in `docs/system-design.md`.
+See `docs/system-design.md` for the deep dive and `TEST_RESULTS.md` for
+measured test evidence.
