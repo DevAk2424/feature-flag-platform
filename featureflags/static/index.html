@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feature Flag Control Plane</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 21V4"/><path d="M4 5h13l-2.5 4L17 13H4"/></svg>
+    <div><h1>Release Control</h1><p>Distributed Feature Flag Platform</p></div>
+  </div>
+  <span id="health" class="pill">checking...</span>
+</header>
+<main>
+  <section>
+    <h2>Flags</h2>
+    <div id="flags" class="grid">Loading flags from the API...</div>
+  </section>
+  <section>
+    <h2>AI Release-Risk Agent</h2>
+    <p class="muted">Recommendations are proposals only. Nothing changes until a proposal is approved with its token.</p>
+    <div id="risk">Ingest metrics for a flag, then request an analysis from a flag card.</div>
+    <div id="proposals"></div>
+  </section>
+  <section>
+    <h2>Audit Log</h2>
+    <button id="refresh-audit" type="button">Refresh audit log</button>
+    <div id="audit" class="audit"></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
